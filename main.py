@@ -1,4 +1,7 @@
 import os
+import hmac
+import hashlib
+import secrets
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,9 +18,9 @@ from database import (
     update_document,
     increment_field,
 )
-from schemas import PupfiUser, Game, Match, Leaderboard, Quest, Claim, Transaction
+from schemas import PupfiUser, Game, Match, Leaderboard, Quest, Claim, Transaction, StakingPool, Badge
 
-app = FastAPI(title="Pupfi Arcade API", version="1.0.0")
+app = FastAPI(title="Pupfi Arcade API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -145,11 +148,18 @@ class CreateMatch(BaseModel):
     seed: int = 0
 
 
+def _commit_reveal_seed():
+    server_secret = secrets.token_hex(16)
+    commit = hashlib.sha256(server_secret.encode()).hexdigest()
+    return commit, server_secret
+
+
 @app.post("/matches")
 def create_match(data: CreateMatch):
     # optional entry fee
     if data.entry_fee > 0:
         spend_tokens(data.creator_id, data.entry_fee, reason="match_entry")
+    commit, secret = _commit_reveal_seed()
     m = Match(
         game_key=data.game_key,
         creator_id=data.creator_id,
@@ -157,6 +167,8 @@ def create_match(data: CreateMatch):
         players=[data.creator_id],
         reward=int(data.entry_fee * 1.8) if data.entry_fee else 0,
         seed=data.seed,
+        server_commit=commit,
+        server_secret=secret,
     )
     match_id = create_document("match", m)
     return get_document_by_id("match", match_id)
@@ -171,16 +183,15 @@ def join_match(match_id: str, user_id: str):
         raise HTTPException(400, "Match already started")
     if user_id in match["players"]:
         return match
-    if len(match["players"]) >= match.get("max_players", 2):
-        # fallback to game preset
-        pass
-    update = update_document("match", match_id, {"players": match["players"] + [user_id]})
+    players = match.get("players", []) + [user_id]
+    update = update_document("match", match_id, {"players": players})
     return update
 
 
 class SubmitScore(BaseModel):
     user_id: str
     score: int
+    client_reveal: Optional[str] = None
 
 
 @app.post("/matches/{match_id}/score")
@@ -190,6 +201,13 @@ def submit_score(match_id: str, payload: SubmitScore):
         raise HTTPException(404, "Match not found")
     if payload.user_id not in match.get("players", []):
         raise HTTPException(403, "Not in match")
+
+    # If commit-reveal is used, verify
+    if payload.client_reveal:
+        combined = (match.get("server_secret", "") + payload.client_reveal).encode()
+        final_seed = int(hashlib.sha256(combined).hexdigest(), 16) % (10**9)
+        update_document("match", match_id, {"client_reveal": payload.client_reveal, "final_seed": final_seed})
+
     scores = match.get("scores", {})
     scores[payload.user_id] = max(scores.get(payload.user_id, 0), payload.score)
     update = update_document("match", match_id, {"scores": scores})
@@ -246,12 +264,116 @@ def claim_quest(key: str, user_id: str):
     return {"ok": True, "reward": reward}
 
 
-# -------- Utility --------
+# -------- Wallet Linking & Session Wallets --------
+class LinkWalletPayload(BaseModel):
+    user_id: str
+    address: str
+
+
+@app.post("/wallet/link")
+def link_wallet(payload: LinkWalletPayload):
+    user = get_document_by_id("pupfiuser", payload.user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if user.get("wallet_address") and user["wallet_address"] != payload.address:
+        raise HTTPException(400, "Wallet already linked to another address")
+    updated = update_document("pupfiuser", payload.user_id, {"wallet_address": payload.address})
+    return updated
+
+
+class CreateSessionWallet(BaseModel):
+    user_id: str
+
+
+@app.post("/wallet/session")
+def create_session_wallet(payload: CreateSessionWallet):
+    # In a real implementation, create ephemeral keypair and return public key
+    public_key = secrets.token_hex(16)
+    updated = update_document("pupfiuser", payload.user_id, {"session_public_key": public_key})
+    return {"public_key": public_key, "user": updated}
+
+
+# -------- Staking Pools (Shared Reward Multipliers) --------
+class StakePayload(BaseModel):
+    user_id: str
+    pool_key: str
+    amount: int
+
+
+@app.post("/staking/stake")
+def stake_tokens(payload: StakePayload):
+    if payload.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+    user = get_document_by_id("pupfiuser", payload.user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if user.get("balance", 0) < payload.amount:
+        raise HTTPException(400, "Insufficient balance")
+    spend_tokens(payload.user_id, payload.amount, reason=f"stake:{payload.pool_key}")
+    pool = find_one("stakingpool", {"key": payload.pool_key})
+    if not pool:
+        pool = {"key": payload.pool_key, "name": payload.pool_key, "total_staked": 0, "participants": {}}
+        pool_id = create_document("stakingpool", pool)
+        pool = get_document_by_id("stakingpool", pool_id)
+    participants = pool.get("participants", {})
+    participants[payload.user_id] = participants.get(payload.user_id, 0) + payload.amount
+    total = pool.get("total_staked", 0) + payload.amount
+    update_document("stakingpool", pool["id"], {"participants": participants, "total_staked": total})
+    return {"ok": True, "pool_key": payload.pool_key, "total_staked": total}
+
+
+@app.get("/staking/pools")
+def list_pools():
+    pools = get_documents("stakingpool")
+    return pools
+
+
+# -------- Spectator Tips (Creator Economy) --------
+class TipPayload(BaseModel):
+    match_id: str
+    from_user: str
+    amount: int
+
+
+@app.post("/tips")
+def tip_match(payload: TipPayload):
+    if payload.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+    match = get_document_by_id("match", payload.match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+    spend_tokens(payload.from_user, payload.amount, reason="tip")
+    tips_total = match.get("tips_total", 0) + payload.amount
+    update_document("match", payload.match_id, {"tips_total": tips_total})
+    return {"ok": True, "tips_total": tips_total}
+
+
+# -------- Badges (Season Pass / NFT-like off-chain) --------
+class MintBadgePayload(BaseModel):
+    user_id: str
+    key: str
+    title: str
+
+
+@app.post("/badges/mint")
+def mint_badge(payload: MintBadgePayload):
+    user = get_document_by_id("pupfiuser", payload.user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    create_document("badge", {"user_id": payload.user_id, "key": payload.key, "title": payload.title, "minted_at": datetime.utcnow()})
+    badges = user.get("badges", [])
+    if payload.key not in badges:
+        badges.append(payload.key)
+    update_document("pupfiuser", payload.user_id, {"badges": badges})
+    return {"ok": True}
+
+
+# -------- Schema Info --------
 @app.get("/schema")
 def schema_info():
     # Expose schema names for admin tools
     return {
-        "collections": ["pupfiuser", "game", "match", "leaderboard", "quest", "claim", "transaction"]
+        "collections": ["pupfiuser", "game", "match", "leaderboard", "quest", "claim", "transaction", "stakingpool", "badge"]
     }
 
 

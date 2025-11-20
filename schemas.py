@@ -12,6 +12,7 @@ class PupfiUser(BaseModel):
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
     wallet_address: Optional[str] = Field(None, description="Linked on-chain address")
+    session_public_key: Optional[str] = Field(None, description="Ephemeral session wallet public key")
     balance: int = Field(0, ge=0, description="Off-chain token balance for gameplay rewards")
     xp: int = 0
     level: int = 1
@@ -37,6 +38,11 @@ class Match(BaseModel):
     winner_id: Optional[str] = None
     reward: int = 0
     seed: int = 0
+    server_commit: Optional[str] = None
+    server_secret: Optional[str] = None
+    client_reveal: Optional[str] = None
+    final_seed: Optional[int] = None
+    tips_total: int = 0
 
 class Leaderboard(BaseModel):
     game_key: str
@@ -61,3 +67,15 @@ class Transaction(BaseModel):
     amount: int
     type: str = Field(..., description="earn, spend, transfer_in, transfer_out")
     reason: str = ""
+
+class StakingPool(BaseModel):
+    key: str
+    name: str
+    total_staked: int = 0
+    participants: Dict[str, int] = {}
+
+class Badge(BaseModel):
+    user_id: str
+    key: str
+    title: str
+    minted_at: datetime = Field(default_factory=datetime.utcnow)
