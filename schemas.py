@@ -1,48 +1,63 @@
 """
-Database Schemas
+Pupfi dApp Schemas
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
-
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Each class corresponds to a MongoDB collection (lowercased class name).
 """
-
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict
+from datetime import datetime
 
-# Example schemas (replace with your own):
+class PupfiUser(BaseModel):
+    username: str = Field(..., min_length=3, max_length=24)
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    wallet_address: Optional[str] = Field(None, description="Linked on-chain address")
+    balance: int = Field(0, ge=0, description="Off-chain token balance for gameplay rewards")
+    xp: int = 0
+    level: int = 1
+    referral_code: Optional[str] = None
+    referred_by: Optional[str] = None
+    streak_days: int = 0
+    last_login_at: Optional[datetime] = None
+    badges: List[str] = []
 
-class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
-    name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+class Game(BaseModel):
+    key: str = Field(..., description="Unique game key, e.g., 'pup-sprint'")
+    name: str
+    description: str
+    max_players: int = 2
+    rules: Dict[str, str] = {}
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+class Match(BaseModel):
+    game_key: str
+    creator_id: str
+    status: str = Field("waiting", description="waiting, active, finished, cancelled")
+    players: List[str] = []
+    scores: Dict[str, int] = {}
+    winner_id: Optional[str] = None
+    reward: int = 0
+    seed: int = 0
 
-# Add your own schemas here:
-# --------------------------------------------------
+class Leaderboard(BaseModel):
+    game_key: str
+    user_id: str
+    score: int
+    username: str
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class Quest(BaseModel):
+    key: str
+    title: str
+    description: str
+    reward: int = 0
+    type: str = Field("daily", description="daily, weekly, special")
+
+class Claim(BaseModel):
+    user_id: str
+    quest_key: str
+    claimed_at: datetime
+
+class Transaction(BaseModel):
+    user_id: str
+    amount: int
+    type: str = Field(..., description="earn, spend, transfer_in, transfer_out")
+    reason: str = ""
